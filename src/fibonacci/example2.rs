@@ -2,18 +2,18 @@ use halo2_proofs::{arithmetic::FieldExt, circuit::*, plonk::*, poly::Rotation};
 use std::marker::PhantomData;
 
 //
-// selector | col_a | col_b | col_c
-// ---------+-------+-------+-------
-//   s0     |   a0  |   b0  |   c0
-//   s1     |   a1  |   b1  |   c1
+// selector |       col    |
+// ---------+--------------|
+//   s0     |      a0      |
+//   s1     |      a1      |
+//   s2     | a2 = a0 + a1 |
+//   s3     | a3 = a1 + a2 |
 //
-// here, we copy the values from previous row(b and c) to the next row(a and b)
-// ==> a1 = b0, b1 = c0
-// So, we need to turn on permutation check on a, b and c
+// In this example, we only use one advice column
 
 #[derive(Debug, Clone)]
 struct FiboConfig {
-    pub advice: [Column<Advice>; 3],
+    pub advice: Column<Advice>,
     pub instance: Column<Instance>,
     pub selector: Selector,
 }
@@ -33,73 +33,76 @@ impl<F: FieldExt> FiboChip<F> {
 
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
-        advice: [Column<Advice>; 3],
+        advice: Column<Advice>,
         instance: Column<Instance>,
     ) -> FiboConfig {
-        let col_a = advice[0];
-        let col_b = advice[1];
-        let col_c = advice[2];
         let selector = meta.selector();
 
         // for permutation check
-        meta.enable_equality(col_a);
-        meta.enable_equality(col_b);
-        meta.enable_equality(col_c);
+        meta.enable_equality(advice);
         meta.enable_equality(instance);
 
         meta.create_gate("add", |meta| {
             let s = meta.query_selector(selector);
-            let a = meta.query_advice(col_a, Rotation::cur());
-            let b = meta.query_advice(col_b, Rotation::cur());
-            let c = meta.query_advice(col_c, Rotation::cur());
+            let a = meta.query_advice(advice, Rotation::cur());
+            let b = meta.query_advice(advice, Rotation::next());
+            let c = meta.query_advice(advice, Rotation(2));
             vec![s * (a + b - c)]
         });
 
         FiboConfig {
-            advice: [col_a, col_b, col_c],
+            advice,
             instance,
             selector,
         }
     }
 
-    pub fn assign_row(
+    pub fn assign(
         &self,
         mut layouter: impl Layouter<F>,
-        prev_b: Option<F>,
-        prev_c: Option<F>,
+        init_a: Option<F>,
+        init_b: Option<F>,
+        iter_num: usize,
     ) -> Result<AssignedCell<F, F>, Error> {
-        // selector | col_a | col_b | col_c
-        // ---------+-------+-------+-------
-        //   s0     |   a0  |   b0  | a0 + b0 = c0
-        //   s1     |   b0  |   c0  | b0 + c0 = c1
-
         layouter.assign_region(
-            || "row",
+            || "fibonacci region",
             |mut region| {
                 self.config.selector.enable(&mut region, 0)?;
-                let c_val = prev_b.and_then(|b| prev_c.map(|c| b + c));
+                self.config.selector.enable(&mut region, 1)?;
 
-                // println!("a:{:?}, b:{:?}", prev_b, prev_c);
+                let mut a = init_a.clone();
+                let mut b = init_b.clone();
+
                 region.assign_advice(
                     || "a",
-                    self.config.advice[0],
+                    self.config.advice,
                     0,
-                    || prev_b.ok_or(Error::Synthesis),
+                    || a.ok_or(Error::Synthesis),
                 )?;
-                region.assign_advice(
+                let mut b_cell = region.assign_advice(
                     || "b",
-                    self.config.advice[1],
-                    0,
-                    || prev_c.ok_or(Error::Synthesis),
-                )?;
-                let c_cell = region.assign_advice(
-                    || "c",
-                    self.config.advice[2],
-                    0,
-                    || c_val.ok_or(Error::Synthesis),
+                    self.config.advice,
+                    1,
+                    || b.ok_or(Error::Synthesis),
                 )?;
 
-                Ok(c_cell)
+                for row in 2..iter_num {
+                    // not to enable selector in the last two rows
+                    if row < iter_num - 2 {
+                        self.config.selector.enable(&mut region, row)?;
+                    }
+
+                    b_cell = region.assign_advice(
+                        || "advice",
+                        self.config.advice,
+                        row,
+                        || b.and_then(|b| a.map(|a| a + b)).ok_or(Error::Synthesis),
+                    )?;
+
+                    a = b;
+                    b = b_cell.value().map(|v| *v);
+                }
+                Ok(b_cell)
             },
         )
     }
@@ -129,12 +132,9 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let col_a = meta.advice_column();
-        let col_b = meta.advice_column();
-        let col_c = meta.advice_column();
+        let advice = meta.advice_column();
         let instance = meta.instance_column();
-
-        FiboChip::configure(meta, [col_a, col_b, col_c], instance)
+        FiboChip::configure(meta, advice, instance)
     }
 
     fn synthesize(
@@ -143,16 +143,7 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let chip = FiboChip::construct(config);
-
-        let mut prev_b = self.a;
-        let mut prev_c = self.b;
-        let mut c_cell = chip.assign_row(layouter.namespace(|| "next row"), prev_b, prev_c)?;
-        for _i in 3..10 {
-            prev_b = prev_c;
-            prev_c = c_cell.value().map(|v| *v);
-            c_cell = chip.assign_row(layouter.namespace(|| "next row"), prev_b, prev_c)?;
-        }
-
+        let c_cell = chip.assign(layouter.namespace(|| "fibonacci table"), self.a, self.b, 10)?;
         chip.expose_public(layouter.namespace(|| "out"), &c_cell, 0)?;
 
         Ok(())
@@ -164,8 +155,8 @@ mod tests {
     use super::MyCircuit;
     use halo2_proofs::{dev::MockProver, pasta::Fp};
     #[test]
-    fn test_example1() {
-        let k = 4;
+    fn test_example2() {
+        let k = 2;
 
         let a = Fp::from(1);
         let b = Fp::from(2);
@@ -182,8 +173,8 @@ mod tests {
     }
 
     #[test]
-    fn test_example1_failed() {
-        let k = 4;
+    fn test_example2_failed() {
+        let k = 2;
 
         let a = Fp::from(1);
         let b = Fp::from(2);
@@ -201,12 +192,11 @@ mod tests {
 
     #[cfg(feature = "dev-graph")]
     #[test]
-    fn plot_fibonacci1() {
+    fn plot_fibonacci2() {
         use plotters::prelude::*;
-
-        let root = BitMapBackend::new("fib-1-layout.png", (1024, 3096)).into_drawing_area();
+        let root = BitMapBackend::new("fib-2-layout.png", (1024, 3096)).into_drawing_area();
         root.fill(&WHITE).unwrap();
-        let root = root.titled("Fib 1 Layout", ("sans-serif", 60)).unwrap();
+        let root = root.titled("Fib 2 Layout", ("sans-serif", 60)).unwrap();
 
         let a = Fp::from(1);
         let b = Fp::from(1);
